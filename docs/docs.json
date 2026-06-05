@@ -398,12 +398,6 @@
         "pages": [
           "seps/index",
           {
-            "group": "Draft",
-            "pages": [
-              "seps/2631-file-objects-and-transfer"
-            ]
-          },
-          {
             "group": "Final",
             "pages": [
               "seps/414-request-meta",
@@ -461,7 +455,8 @@
               "seps/2106-json-schema-2020-12",
               "seps/2164-resource-not-found-error",
               "seps/2484-conformance-tests-required-for-final-seps",
-              "seps/2596-spec-feature-lifecycle-and-deprecation"
+              "seps/2596-spec-feature-lifecycle-and-deprecation",
+              "seps/2631-file-objects-and-transfer"
             ]
           }
         ]
