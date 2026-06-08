@@ -60,6 +60,8 @@ filesystem access or depend on provider-specific save tools after every edit.
   filesystem access.
 - Use SEP-2631 for operation content without treating transfer handles as durable
   identity.
+- Allow Git-backed adapters and native Git clients to coexist without requiring non-Git
+  providers to synthesize commits, refs, or object databases.
 
 ## Non-Goals
 
@@ -135,6 +137,63 @@ flowchart LR
 The MCP server never requires arbitrary access to the host filesystem. The host reads and
 writes local files; the server reads and writes provider state.
 
+## Relationship to Git
+
+Git is the preferred protocol when a root is already a Git repository and the client
+needs Git semantics such as durable history, branches, merges, patches, code review, or
+offline distributed development. This SEP does not require clients to access such roots
+through `fileProviders/*`, and it does not attempt to replace native Git transports.
+
+A Git-backed MCP server can still implement this SEP when a host needs a provider-neutral
+workspace abstraction. It can map a selected ref to a provider root, commits or trees to
+root revisions, and blobs to file content. The adapter remains responsible for preserving
+Git's stronger semantics; clients **MUST NOT** assume that every provider root has commit
+history, branches, merge bases, or content-addressed node identity merely because a Git
+adapter can supply them.
+
+Git is not the universal provider contract for this SEP because many target systems are
+mutable object stores rather than repositories:
+
+- A provider file has stable object identity across rename and move. Git records paths in
+  trees and normally infers renames from similar delete/create pairs rather than storing a
+  durable file identity.
+- Providers expose per-object revisions, permissions, retention rules, and change feeds.
+  Git primarily coordinates immutable object graphs through mutable refs.
+- Native cloud documents can require explicit export and import representations and may
+  not have canonical transferable source bytes.
+- Provider roots can enforce per-node no-copy, no-cache, no-index, or conditional
+  write-back policy that does not map naturally to a cloned object database.
+- Automatically translating filesystem events into Git commits would introduce commit
+  authorship, messages, history retention, branching, and merge policy that the provider
+  and user did not request.
+- Large binary content, partial hydration, and provider-side conversion often require a
+  separate data plane even when Git or Git LFS is used.
+
+Clients can therefore choose native Git for repository-shaped roots and this SEP for
+provider-shaped roots. A product can support both paths and select between them based on
+the root's advertised capabilities and the user's workflow.
+
+### Git-Inspired Semantics
+
+This SEP deliberately adopts several Git design principles without adopting Git's full
+repository model:
+
+| Git concept                           | SEP analogue                                                   | Adaptation                                                                                             |
+| ------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Immutable blobs identified by content | `FileDigest` on transferred content                            | Integrity and deduplication are separate from mutable provider node identity.                          |
+| Tree snapshots                        | `snapshotRevision` and hierarchical `FileProviderNode` results | Pagination remains pinned to one provider snapshot even when the provider changes concurrently.        |
+| Compare-and-swap ref updates          | `expectedRevision` and optional `baseRevision`                 | Preconditions apply per node or root instead of only to a branch ref.                                  |
+| Atomic reference transactions         | `all_or_nothing` batch commits                                 | Providers can apply a related mutation set atomically when supported.                                  |
+| Index or staging area                 | Host-private journal and pending operation queue               | Local edits are collected deterministically before an explicit conditional commit.                     |
+| Fetch negotiation and partial clone   | Selective listing and lazy `getContent`                        | Hosts can hydrate only needed metadata or bytes without requiring a complete object database.          |
+| Reflog and commit history             | Durable change cursor and ordered change records               | The feed supports recovery and deduplication but is not required to be permanent user-visible history. |
+| Push rejection and merge conflicts    | Structured operation conflicts                                 | The protocol prevents silent overwrite while leaving text or semantic merge to the host or provider.   |
+| Separate Git LFS object transfer      | SEP-2631 control/data-plane separation                         | Durable provider identity does not depend on an expiring byte-transfer URL.                            |
+
+Two Git behaviors are intentionally not copied. Renames are first-class provider events
+that preserve `nodeId`, rather than similarity-based inference. Provider revisions and
+change cursors are opaque values, rather than hashes clients can parse or recompute.
+
 ## Specification
 
 ### 1. Capabilities
@@ -160,16 +219,6 @@ Clients declare supported behavior in per-request capabilities:
 ```json
 {
   "io.modelcontextprotocol/clientCapabilities": {
-    "files": {
-      "upload": {},
-      "download": {},
-      "transports": {
-        "https": {
-          "resumableUpload": true,
-          "rangeDownload": true
-        }
-      }
-    },
     "fileProviders": {
       "notifications": true,
       "partialCommits": true,
@@ -361,6 +410,9 @@ interface GetFileProviderContentResult extends Result {
 
 The server **MUST** either return content corresponding exactly to `revision` or return a
 `nodeRevisionMismatch` conflict. It **MUST NOT** silently substitute newer bytes.
+
+For this SEP, the returned `FileValue` **MUST** include its byte size and a `sha-256`
+digest so the host can verify that materialized bytes match the selected node revision.
 
 The host resolves `file.uri` through `files/getDownload`, verifies available size and
 digest metadata, and writes the file atomically. The host privately records `rootId`,
@@ -682,7 +734,7 @@ sequenceDiagram
 
     Disk-->>Host: Local file changed
     Host->>Host: Resolve nodeId and expectedRevision
-    Host->>Server: files/prepareUpload(idempotencyKey, size, digest)
+    Host->>Server: files/prepareUpload(size, digest)
     Server-->>Host: uploadId + transfer descriptor
     Host->>Endpoint: Upload or resume local bytes
     Host->>Server: files/completeUpload(uploadId, size, digest)
@@ -715,10 +767,10 @@ sequenceDiagram
 
 - Snapshot pagination is repeatable within one `snapshotRevision`.
 - Change delivery is at least once and ordered within a root.
-- Commit and upload retries are idempotent.
+- Provider commit retries are idempotent. A failed upload can be retried with a new
+  upload handle.
 - Transfer URLs can expire independently of file, upload, root, and node handles.
-- A host can request a replacement transfer descriptor without changing durable node
-  identity.
+- A host can resolve a fresh download descriptor without changing durable node identity.
 - The host advances its change cursor only after durable local application.
 - The server rechecks authorization, policy, capabilities, and revisions at commit time.
 - Concurrent remote changes never result in silent overwrite.
@@ -762,8 +814,9 @@ errors.
 - Hosts **MUST** scope local materialization to the selected root and prevent names from
   escaping the workspace through traversal, reserved paths, symlinks, or platform path
   normalization.
-- Hosts **MUST** follow SEP-2631 bearer-capability, redirect, SSRF, integrity, and ambient
-  credential requirements when transferring operation content.
+- Hosts **MUST** follow SEP-2631 bearer-capability and integrity requirements when
+  transferring operation content. They also **MUST** apply host egress, redirect, SSRF,
+  and ambient-credential policy to transfer endpoints.
 - Durable provider identity and revisions **SHOULD** remain host-private rather than
   model-visible by default.
 - Servers and hosts **SHOULD** audit cross-scope copies, durable writes, deletes, native
@@ -802,6 +855,19 @@ Conforming implementations should test:
 - path traversal, normalization collision, and unsafe symlink defenses.
 
 ## Alternatives Considered
+
+### Use Git as the Universal Provider Protocol
+
+Native Git is a better choice for roots that already have repository semantics. It was
+not selected as the universal contract because requiring every Box folder, Drive, native
+cloud document, or object store to synthesize blobs, trees, commits, refs, and merge
+history would add semantics those providers do not possess. It would also lose or
+externalize stable provider object identity, per-node policy, native representations, and
+provider change cursors.
+
+Implementations **MAY** expose both a native Git endpoint and this SEP. They should avoid
+creating a synthetic Git history solely to satisfy workspace synchronization when the
+underlying provider has no user-visible source-control model.
 
 ### Put Synchronization Directly in SEP-2631
 
@@ -847,6 +913,16 @@ a valid deployment choice.
 
 ## Related Work
 
+- [Git objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects): immutable
+  blobs, trees, and commits.
+- [Git protocol v2](https://git-scm.com/docs/protocol-v2): capability advertisement,
+  reference discovery, and fetch negotiation.
+- [Git partial clone](https://git-scm.com/docs/partial-clone): filtered object transfer
+  and lazy retrieval from promisor remotes.
+- [Git update-ref](https://git-scm.com/docs/git-update-ref): compare-and-swap and atomic
+  reference transactions.
+- [Git diffcore](https://git-scm.com/docs/gitdiffcore): similarity-based rename and copy
+  detection.
 - [SEP-2631](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2631):
   file objects and transfer.
 - [SEP-2575](/seps/2575-stateless-mcp): stateless MCP and per-request capabilities.
